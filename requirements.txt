@@ -35,6 +35,9 @@ datetime  # Python内置
 # 类型提示
 typing  # Python内置
 
+# 加密库 - 新增
+pycryptodome==3.19.0
+
 # 可选：向量数据库（如果使用ChromaDB）
 # chromadb==0.4.18
 
@@ -50,3 +53,6 @@ typing  # Python内置
 # pytest-asyncio==0.21.1
 # black==23.11.0
 # flake8==6.1.0
+
+
+http://192.168.150.252:888/app/api/content/article/

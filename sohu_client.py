@@ -1,35 +1,41 @@
 # -*- coding: utf-8 -*-
 """
-SohuGlobal API客户端
+SohuGlobal API客户端 - 完整版本
+支持加密认证和所有接口
 """
 
 import logging
 import asyncio
 import aiohttp
 import json
+import hashlib
+import hmac
+import time
+import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-import time
-
-from new_config import CONFIG
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+import base64
 
 logger = logging.getLogger(__name__)
 
 class SohuAPIClient:
-    """SohuGlobal API客户端"""
+    """SohuGlobal API客户端 - 完整版本"""
     
     def __init__(self):
-        self.base_url = CONFIG["sohu_api"]["base_url"]
-        self.phone = CONFIG["sohu_api"]["login_phone"]
-        self.password = CONFIG["sohu_api"]["login_password"]
-        self.timeout = CONFIG["sohu_api"]["timeout"]
-        self.max_retries = CONFIG["sohu_api"]["max_retries"]
-        
-        self.token = None
-        self.token_expires_at = None
+        # 新的接口地址
+        self.base_url = "http://192.168.150.252:888"
+        self.timeout = 15
+        self.max_retries = 3
         self.session = None
         
-        logger.info("SohuGlobal API客户端初始化完成")
+        # 加密参数
+        self.hmac_key = None
+        self.aes_key = None
+        self.iv = None
+        
+        logger.info("完整版SohuGlobal API客户端初始化完成")
     
     async def __aenter__(self):
         """异步上下文管理器入口"""
@@ -43,9 +49,110 @@ class SohuAPIClient:
         if self.session:
             await self.session.close()
     
+    async def _get_encryption_keys(self) -> bool:
+        """获取加密密钥"""
+        try:
+            url = f"{self.base_url}/app/v1/query/aesKey"
+            
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    if result.get("code") == 200:
+                        data = result.get("data", {})
+                        self.hmac_key = data.get("hmacKey")
+                        self.aes_key = data.get("aesKey")
+                        self.iv = data.get("iv")
+                        
+                        if self.hmac_key and self.aes_key and self.iv:
+                            logger.info("成功获取加密密钥")
+                            return True
+                
+                logger.error(f"获取加密密钥失败: {result}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"获取加密密钥异常: {e}")
+            return False
+    
+    def _generate_nonce(self) -> str:
+        """生成随机字符串，不低于18位"""
+        return str(uuid.uuid4()).replace('-', '') + str(int(time.time() * 1000))[-6:]
+    
+    def _get_encrypt_data(self, url: str) -> Dict[str, Any]:
+        """获取加密数据 - 完全对应前端的getEncryptData函数"""
+        # 构建参数（与前端完全一致）
+        obj = {
+            "token": "",  # 非登录接口可为空字符串
+            "userId": 0,    # 非登录接口可为0
+            "timestamp": int(time.time() * 1000),
+            "url": url,
+            "platform": "web",
+            "nonce": self._generate_nonce(),
+        }
+        
+        # 过滤并排序参数（排除sign字段）
+        filtered_params = {}
+        for key in sorted(obj.keys()):
+            if key != "sign" and obj[key] is not None:
+                filtered_params[key] = obj[key]
+        
+        # 拼接键值对，最后加上key=hmacKey
+        query_string = ""
+        for key, value in filtered_params.items():
+            query_string += f"{key}={value}&"
+        query_string += f"key={self.hmac_key}"
+        
+        # 计算HMAC-SHA256签名
+        hmac_obj = hmac.new(
+            self.hmac_key.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        )
+        signature = hmac_obj.hexdigest()
+        
+        obj["sign"] = signature
+        return obj
+    
+    def _get_encrypt(self, data: str) -> str:
+        """获取加密字符串 - 对应前端的getEncrypt函数"""
+        if not self.aes_key or not self.iv:
+            raise ValueError("AES密钥或IV未设置")
+        
+        # AES加密
+        cipher = AES.new(
+            self.aes_key.encode('utf-8'),
+            AES.MODE_CBC,
+            self.iv.encode('utf-8')
+        )
+        
+        # 填充数据
+        padded_data = pad(data.encode('utf-8'), AES.block_size)
+        encrypted = cipher.encrypt(padded_data)
+        
+        return base64.b64encode(encrypted).decode('utf-8')
+    
+    def _get_decrypt(self, encrypted_data: str) -> str:
+        """解密字符串"""
+        if not self.aes_key or not self.iv:
+            raise ValueError("AES密钥或IV未设置")
+        
+        # AES解密
+        cipher = AES.new(
+            self.aes_key.encode('utf-8'),
+            AES.MODE_CBC,
+            self.iv.encode('utf-8')
+        )
+        
+        # 解密
+        encrypted_bytes = base64.b64decode(encrypted_data)
+        decrypted = cipher.decrypt(encrypted_bytes)
+        
+        # 去除填充
+        return unpad(decrypted, AES.block_size).decode('utf-8')
+    
     async def _make_request(self, method: str, endpoint: str, 
                           data: Dict = None, params: Dict = None,
-                          headers: Dict = None) -> Dict[str, Any]:
+                          headers: Dict = None, use_encryption: bool = True) -> Dict[str, Any]:
         """发起HTTP请求"""
         url = f"{self.base_url}{endpoint}"
         
@@ -54,40 +161,60 @@ class SohuAPIClient:
         if headers:
             request_headers.update(headers)
         
-        # 添加认证Token
-        if self.token and endpoint != "/api/user/login":
-            request_headers["Authorization"] = f"Bearer {self.token}"
+        # 如果需要加密认证
+        if use_encryption and self.hmac_key:
+            encrypt_data = self._get_encrypt_data(endpoint)
+            
+            # 将加密数据JSON序列化后用AES加密，作为x-encrypt-key请求头发送
+            json_data = json.dumps(encrypt_data, ensure_ascii=False)
+            encrypted_key = self._get_encrypt(json_data)
+            
+            request_headers["x-encrypt-key"] = encrypted_key
+            
+            # 调试信息
+            logger.debug(f"加密数据: {encrypt_data}")
+            logger.debug(f"JSON数据: {json_data}")
+            logger.debug(f"加密后的key: {encrypted_key}")
+            logger.debug(f"加密请求头: {request_headers}")
         
         # 重试逻辑
         for attempt in range(self.max_retries + 1):
             try:
                 if method.upper() == "GET":
                     async with self.session.get(url, params=params, headers=request_headers) as response:
-                        result = await response.json()
+                        if response.status == 200:
+                            try:
+                                result = await response.json()
+                                return result
+                            except:
+                                text = await response.text()
+                                return {"code": 200, "data": text, "msg": "返回文本内容"}
+                        else:
+                            text = await response.text()
+                            logger.warning(f"API请求失败: HTTP {response.status}, {text}")
+                            return {"code": response.status, "msg": text}
+                
                 elif method.upper() == "POST":
                     async with self.session.post(url, json=data, params=params, headers=request_headers) as response:
-                        result = await response.json()
+                        if response.status == 200:
+                            try:
+                                result = await response.json()
+                                return result
+                            except:
+                                text = await response.text()
+                                return {"code": 200, "data": text, "msg": "返回文本内容"}
+                        else:
+                            text = await response.text()
+                            logger.warning(f"API请求失败: HTTP {response.status}, {text}")
+                            return {"code": response.status, "msg": text}
                 else:
                     raise ValueError(f"不支持的HTTP方法: {method}")
-                
-                # 检查响应状态
-                if result.get("code") == 200:
-                    return result
-                elif result.get("code") == 401:
-                    # Token过期，尝试重新登录
-                    if await self._login():
-                        continue  # 重试请求
-                    else:
-                        raise Exception("登录失败，无法获取有效Token")
-                else:
-                    logger.warning(f"API请求失败: {result}")
-                    return result
                 
             except asyncio.TimeoutError:
                 logger.warning(f"请求超时 (尝试 {attempt + 1}/{self.max_retries + 1}): {url}")
                 if attempt == self.max_retries:
                     raise
-                await asyncio.sleep(1)  # 等待1秒后重试
+                await asyncio.sleep(1)
             
             except Exception as e:
                 logger.error(f"请求异常 (尝试 {attempt + 1}/{self.max_retries + 1}): {e}")
@@ -95,41 +222,13 @@ class SohuAPIClient:
                     raise
                 await asyncio.sleep(1)
     
-    async def _login(self) -> bool:
-        """登录获取Token"""
-        try:
-            login_data = {
-                "phone": self.phone,
-                "password": self.password
-            }
-            
-            response = await self._make_request("POST", "/api/user/login", data=login_data)
-            
-            if response.get("code") == 200:
-                user_data = response.get("data", {})
-                self.token = user_data.get("token")
-                
-                if self.token:
-                    # 设置Token过期时间（假设24小时有效）
-                    self.token_expires_at = time.time() + 24 * 3600
-                    logger.info("SohuGlobal API登录成功")
-                    return True
-            
-            logger.error(f"登录失败: {response}")
-            return False
-            
-        except Exception as e:
-            logger.error(f"登录异常: {e}")
-            return False
-    
-    async def _ensure_authenticated(self) -> bool:
-        """确保已认证"""
-        # 检查Token是否存在且未过期
-        if self.token and self.token_expires_at and time.time() < self.token_expires_at:
+    async def _ensure_encryption_ready(self) -> bool:
+        """确保加密参数已准备"""
+        if self.hmac_key and self.aes_key and self.iv:
             return True
         
-        # 尝试登录
-        return await self._login()
+        # 获取加密密钥
+        return await self._get_encryption_keys()
     
     # =============================================================================
     # 内容获取接口
@@ -137,10 +236,7 @@ class SohuAPIClient:
     
     async def get_articles(self, page: int = 1, size: int = 10, 
                           keyword: str = None, category_id: int = None) -> Dict[str, Any]:
-        """获取文章列表"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
-        
+        """获取文章列表 - 新接口"""
         params = {"page": page, "size": size}
         if keyword:
             params["keyword"] = keyword
@@ -148,7 +244,7 @@ class SohuAPIClient:
             params["categoryId"] = category_id
         
         try:
-            response = await self._make_request("GET", "/api/article/list", params=params)
+            response = await self._make_request("GET", "/app/api/content/article/", params=params)
             logger.info(f"获取文章列表: 页码={page}, 数量={size}")
             return response
         except Exception as e:
@@ -156,238 +252,227 @@ class SohuAPIClient:
             return {"code": 500, "msg": f"请求失败: {str(e)}"}
     
     async def get_article_detail(self, article_id: int) -> Dict[str, Any]:
-        """获取文章详情"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
+        """获取文章详情 - 新接口"""
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
         
         try:
-            response = await self._make_request("GET", f"/api/article/{article_id}")
+            response = await self._make_request("GET", f"/app/api/content/article/{article_id}")
             logger.info(f"获取文章详情: ID={article_id}")
             return response
         except Exception as e:
             logger.error(f"获取文章详情失败: {e}")
             return {"code": 500, "msg": f"请求失败: {str(e)}"}
     
-    async def get_videos(self, page: int = 1, size: int = 10,
-                        keyword: str = None, category_id: int = None) -> Dict[str, Any]:
-        """获取视频列表"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
+    async def search_articles(self, keyword: str, page: int = 1, size: int = 10) -> Dict[str, Any]:
+        """搜索文章 - 新接口"""
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
         
-        params = {"page": page, "size": size}
-        if keyword:
-            params["keyword"] = keyword
-        if category_id:
-            params["categoryId"] = category_id
-        
-        try:
-            response = await self._make_request("GET", "/api/video/list", params=params)
-            logger.info(f"获取视频列表: 页码={page}, 数量={size}")
-            return response
-        except Exception as e:
-            logger.error(f"获取视频列表失败: {e}")
-            return {"code": 500, "msg": f"请求失败: {str(e)}"}
-    
-    async def get_video_detail(self, video_id: int) -> Dict[str, Any]:
-        """获取视频详情"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
-        
-        try:
-            response = await self._make_request("GET", f"/api/video/{video_id}")
-            logger.info(f"获取视频详情: ID={video_id}")
-            return response
-        except Exception as e:
-            logger.error(f"获取视频详情失败: {e}")
-            return {"code": 500, "msg": f"请求失败: {str(e)}"}
-    
-    async def get_products(self, page: int = 1, size: int = 10,
-                          keyword: str = None, category_id: int = None) -> Dict[str, Any]:
-        """获取商品列表"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
-        
-        params = {"page": page, "size": size}
-        if keyword:
-            params["keyword"] = keyword
-        if category_id:
-            params["categoryId"] = category_id
-        
-        try:
-            response = await self._make_request("GET", "/api/product/list", params=params)
-            logger.info(f"获取商品列表: 页码={page}, 数量={size}")
-            return response
-        except Exception as e:
-            logger.error(f"获取商品列表失败: {e}")
-            return {"code": 500, "msg": f"请求失败: {str(e)}"}
-    
-    async def get_product_detail(self, product_id: int) -> Dict[str, Any]:
-        """获取商品详情"""
-        if not await self._ensure_authenticated():
-            return {"code": 401, "msg": "认证失败"}
-        
-        try:
-            response = await self._make_request("GET", f"/api/product/{product_id}")
-            logger.info(f"获取商品详情: ID={product_id}")
-            return response
-        except Exception as e:
-            logger.error(f"获取商品详情失败: {e}")
-            return {"code": 500, "msg": f"请求失败: {str(e)}"}
-    
-    # =============================================================================
-    # 内容获取批量接口
-    # =============================================================================
-    
-    async def get_content_by_id(self, content_id: int, content_type: str = None) -> Dict[str, Any]:
-        """根据ID获取内容详情（自动判断类型）"""
-        # 如果指定了类型，直接调用对应接口
-        if content_type == "article":
-            return await self.get_article_detail(content_id)
-        elif content_type == "video":
-            return await self.get_video_detail(content_id)
-        elif content_type == "product":
-            return await self.get_product_detail(content_id)
-        
-        # 否则尝试各种类型
-        for content_type, method in [
-            ("article", self.get_article_detail),
-            ("video", self.get_video_detail),
-            ("product", self.get_product_detail)
-        ]:
-            try:
-                result = await method(content_id)
-                if result.get("code") == 200:
-                    # 在返回数据中添加类型信息
-                    if "data" in result and result["data"]:
-                        result["data"]["content_type"] = content_type
-                    return result
-            except Exception as e:
-                logger.debug(f"尝试获取{content_type} {content_id}失败: {e}")
-                continue
-        
-        return {"code": 404, "msg": "内容不存在"}
-    
-    async def get_contents_batch(self, content_ids: List[int], 
-                               content_type: str = None) -> Dict[str, Any]:
-        """批量获取内容详情"""
-        if not content_ids:
-            return {"code": 400, "msg": "内容ID列表为空"}
-        
-        results = {"contents": [], "total_requested": len(content_ids), "missing_ids": []}
-        
-        # 并发获取内容
-        tasks = []
-        for content_id in content_ids:
-            task = self.get_content_by_id(content_id, content_type)
-            tasks.append((content_id, task))
-        
-        # 执行并发请求
-        responses = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-        
-        # 处理结果
-        for (content_id, _), response in zip(tasks, responses):
-            if isinstance(response, Exception):
-                logger.error(f"获取内容 {content_id} 异常: {response}")
-                results["missing_ids"].append(content_id)
-            elif response.get("code") == 200 and response.get("data"):
-                results["contents"].append(response["data"])
-            else:
-                logger.warning(f"内容 {content_id} 获取失败: {response}")
-                results["missing_ids"].append(content_id)
-        
-        results["total_found"] = len(results["contents"])
-        
-        return {
-            "code": 200,
-            "msg": "批量获取完成",
-            "data": results
+        params = {
+            "keyword": keyword,
+            "page": page,
+            "size": size
         }
+        
+        try:
+            response = await self._make_request("GET", "/app/api/content/article/search", params=params)
+            logger.info(f"搜索文章: 关键词={keyword}, 页码={page}")
+            return response
+        except Exception as e:
+            logger.error(f"搜索文章失败: {e}")
+            return {"code": 500, "msg": f"请求失败: {str(e)}"}
+    
+    async def get_categories(self) -> Dict[str, Any]:
+        """获取文章分类 - 新接口"""
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
+        
+        try:
+            response = await self._make_request("GET", "/app/api/content/category/")
+            logger.info("获取文章分类")
+            return response
+        except Exception as e:
+            logger.error(f"获取文章分类失败: {e}")
+            return {"code": 500, "msg": f"请求失败: {str(e)}"}
     
     # =============================================================================
-    # 内容搜索和分页获取
+    # 批量获取和分页获取
     # =============================================================================
     
-    async def fetch_all_content_by_type(self, content_type: str, 
-                                       max_pages: int = 10, 
-                                       page_size: int = 20) -> List[Dict[str, Any]]:
-        """获取指定类型的所有内容"""
-        all_contents = []
+    async def get_all_articles(self, max_pages: int = 10, page_size: int = 20) -> List[Dict[str, Any]]:
+        """获取所有文章"""
+        all_articles = []
         
-        # 选择对应的获取方法
-        if content_type == "article":
-            fetch_method = self.get_articles
-        elif content_type == "video":
-            fetch_method = self.get_videos
-        elif content_type == "product":
-            fetch_method = self.get_products
-        else:
-            logger.error(f"不支持的内容类型: {content_type}")
-            return []
-        
-        # 分页获取
         for page in range(1, max_pages + 1):
             try:
-                response = await fetch_method(page=page, size=page_size)
+                response = await self.get_articles(page=page, size=page_size)
                 
                 if response.get("code") == 200:
-                    data = response.get("data", {})
-                    contents = data.get("list", [])
+                    data = response.get("data", [])
                     
-                    if not contents:
-                        logger.info(f"第{page}页没有更多{content_type}内容")
+                    if not data:
+                        logger.info(f"第{page}页没有更多文章")
                         break
                     
-                    # 添加内容类型标识
-                    for content in contents:
-                        content["content_type"] = content_type
+                    all_articles.extend(data)
+                    logger.info(f"获取文章第{page}页: {len(data)}条")
                     
-                    all_contents.extend(contents)
-                    logger.info(f"获取{content_type}第{page}页: {len(contents)}条内容")
-                    
-                    # 检查是否还有更多页
-                    total_pages = data.get("pages", 0)
-                    if page >= total_pages:
-                        logger.info(f"{content_type}内容获取完成，总页数: {total_pages}")
+                    # 如果返回的数据少于页面大小，说明是最后一页
+                    if len(data) < page_size:
                         break
                         
                 else:
-                    logger.warning(f"获取{content_type}第{page}页失败: {response}")
+                    logger.warning(f"获取文章第{page}页失败: {response}")
                     break
                     
             except Exception as e:
-                logger.error(f"获取{content_type}第{page}页异常: {e}")
+                logger.error(f"获取文章第{page}页异常: {e}")
                 break
             
             # 避免请求过快
             await asyncio.sleep(0.1)
         
-        logger.info(f"总共获取{content_type}内容: {len(all_contents)}条")
-        return all_contents
+        logger.info(f"总共获取文章: {len(all_articles)}条")
+        return all_articles
     
-    async def fetch_all_contents(self, max_pages_per_type: int = 5,
-                               page_size: int = 20) -> List[Dict[str, Any]]:
-        """获取所有类型的内容"""
-        all_contents = []
+    async def get_articles_by_category(self, category_id: int, max_pages: int = 5, page_size: int = 20) -> List[Dict[str, Any]]:
+        """根据分类获取文章"""
+        all_articles = []
         
-        content_types = ["article", "video", "product"]
+        for page in range(1, max_pages + 1):
+            try:
+                response = await self.get_articles(page=page, size=page_size, category_id=category_id)
+                
+                if response.get("code") == 200:
+                    data = response.get("data", [])
+                    
+                    if not data:
+                        logger.info(f"分类{category_id}第{page}页没有更多文章")
+                        break
+                    
+                    all_articles.extend(data)
+                    logger.info(f"获取分类{category_id}第{page}页: {len(data)}条")
+                    
+                    if len(data) < page_size:
+                        break
+                        
+                else:
+                    logger.warning(f"获取分类{category_id}第{page}页失败: {response}")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"获取分类{category_id}第{page}页异常: {e}")
+                break
+            
+            await asyncio.sleep(0.1)
         
-        # 并发获取各类型内容
-        tasks = []
-        for content_type in content_types:
-            task = self.fetch_all_content_by_type(content_type, max_pages_per_type, page_size)
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # 合并结果
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"获取{content_types[i]}内容异常: {result}")
+        logger.info(f"分类{category_id}总共获取文章: {len(all_articles)}条")
+        return all_articles
+    
+    # =============================================================================
+    # 测试方法
+    # =============================================================================
+    
+    async def test_connection(self) -> Dict[str, Any]:
+        """测试连接"""
+        try:
+            # 尝试获取文章列表
+            articles = await self.get_articles(page=1, size=5)
+            return {
+                "success": True,
+                "message": "连接成功",
+                "test_result": articles
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"连接测试失败: {str(e)}",
+                "error": str(e)
+            }
+    
+    async def test_encryption(self) -> Dict[str, Any]:
+        """测试加密功能"""
+        try:
+            if await self._ensure_encryption_ready():
+                # 测试加密
+                test_string = "Hello, Sohu API!"
+                encrypted = self._get_encrypt(test_string)
+                decrypted = self._get_decrypt(encrypted)
+                
+                return {
+                    "success": True,
+                    "message": "加密功能正常",
+                    "encryption_keys": {
+                        "hmac_key": self.hmac_key[:20] + "..." if self.hmac_key else None,
+                        "aes_key": self.aes_key,
+                        "iv": self.iv
+                    },
+                    "test_result": {
+                        "original": test_string,
+                        "encrypted": encrypted,
+                        "decrypted": decrypted,
+                        "match": test_string == decrypted
+                    }
+                }
             else:
-                all_contents.extend(result)
-        
-        logger.info(f"总共获取内容: {len(all_contents)}条")
-        return all_contents
+                return {
+                    "success": False,
+                    "message": "加密参数获取失败"
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"加密测试失败: {str(e)}",
+                "error": str(e)
+            }
 
 # 创建全局客户端实例
 sohu_client = SohuAPIClient()
+
+# 测试函数
+async def test_full_sohu_client():
+    """测试完整版搜狐客户端"""
+    async with sohu_client as client:
+        try:
+            # 测试连接
+            result = await client.test_connection()
+            print("连接测试结果:", json.dumps(result, indent=2, ensure_ascii=False))
+            
+            # 测试加密功能
+            encrypt_result = await client.test_encryption()
+            print("\n加密测试结果:", json.dumps(encrypt_result, indent=2, ensure_ascii=False))
+            
+            if result["success"] and encrypt_result["success"]:
+                # 获取文章列表
+                articles = await client.get_articles(page=1, size=10)
+                print("\n文章列表:", json.dumps(articles, indent=2, ensure_ascii=False))
+                
+                # 测试加密接口
+                print("\n测试加密接口...")
+                
+                # 获取分类
+                categories = await client.get_categories()
+                print("\n分类列表:", json.dumps(categories, indent=2, ensure_ascii=False))
+                
+                # 搜索文章
+                search_result = await client.search_articles("测试", page=1, size=5)
+                print("\n搜索结果:", json.dumps(search_result, indent=2, ensure_ascii=False))
+                
+                # 如果有文章，尝试获取详情
+                if articles and "data" in articles and "list" in articles["data"]:
+                    article_list = articles["data"]["list"]
+                    if article_list:
+                        first_article = article_list[0]
+                        article_id = first_article.get("id")
+                        if article_id:
+                            print(f"\n获取文章详情 (ID: {article_id})...")
+                            detail = await client.get_article_detail(article_id)
+                            print(f"文章详情: {json.dumps(detail, indent=2, ensure_ascii=False)}")
+                
+        except Exception as e:
+            print(f"测试失败: {e}")
+
+if __name__ == "__main__":
+    # 运行测试
+    asyncio.run(test_full_sohu_client())
