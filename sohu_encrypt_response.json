@@ -1,0 +1,9 @@
+{
+  "code": 200,
+  "msg": "操作成功",
+  "data": {
+    "hmacKey": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef",
+    "aesKey": "0123456789abcdef",
+    "iv": "56781234efghabcd"
+  }
+}

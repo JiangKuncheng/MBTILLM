@@ -49,6 +49,10 @@ class UserProfile(Base):
     last_updated = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
     
+    # 推荐进度跟踪
+    current_recommendation_page = Column(Integer, default=0)  # 当前推荐到的页数
+    last_recommendation_time = Column(DateTime, default=datetime.utcnow)  # 最后推荐时间
+    
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""
         return {
@@ -69,7 +73,11 @@ class UserProfile(Base):
             "total_behaviors_analyzed": self.total_behaviors_analyzed,
             "behaviors_since_last_update": self.behaviors_since_last_update,
             "last_updated": self.last_updated.isoformat() if self.last_updated else None,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "recommendation_progress": {
+                "current_page": self.current_recommendation_page,
+                "last_recommendation_time": self.last_recommendation_time.isoformat() if self.last_recommendation_time else None
+            }
         }
 
 class UserBehavior(Base):
@@ -119,6 +127,14 @@ class ContentMBTI(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     content_id = Column(Integer, nullable=False, index=True)
     
+    # 帖子内容字段（从搜狐API获取）
+    title = Column(String(500), nullable=True)  # 帖子标题
+    cover_image = Column(String(1000), nullable=True)  # 封面图URL
+    content = Column(Text, nullable=True)  # 帖子内容
+    author = Column(String(100), nullable=True)  # 作者
+    publish_time = Column(DateTime, nullable=True)  # 发布时间
+    content_type = Column(String(50), default="article")  # 内容类型
+    
     # MBTI概率分布
     E = Column(Float, default=0.5)
     I = Column(Float, default=0.5) 
@@ -141,6 +157,12 @@ class ContentMBTI(Base):
         """转换为字典格式"""
         return {
             "content_id": self.content_id,
+            "title": self.title,
+            "cover_image": self.cover_image,
+            "content": self.content,
+            "author": self.author,
+            "publish_time": self.publish_time.isoformat() if self.publish_time else None,
+            "content_type": self.content_type,
             "mbti_vector": self.get_vector(),
             "probabilities": {
                 "E": self.E, "I": self.I,

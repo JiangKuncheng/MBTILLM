@@ -291,13 +291,13 @@ async def quick_demo():
                         for i, rec in enumerate(recs[:5]):
                             content_id = rec["content_id"]
                             similarity = rec["similarity_score"]
-                            traits = ", ".join(rec["mbti_match_traits"])
+                
                             
                             # 查找对应的内容标题
                             content_title = demo_content_titles.get(content_id, "未知内容")
                             
                             print(f"    {i+1}. 内容 {content_id}: {content_title}")
-                            print(f"       相似度: {similarity:.3f} | 匹配特征: [{traits}]")
+                            print(f"       相似度: {similarity:.3f}")
                     else:
                         print(f"  ⚠️  暂无推荐内容")
                 else:

@@ -133,8 +133,23 @@ class DatabaseService:
                            weight: float = None, source: str = "unknown",
                            session_id: str = None, extra_data: Dict = None,
                            timestamp: datetime = None) -> UserBehavior:
-        """记录用户行为"""
+        """记录用户行为 - 只记录对有实际内容的内容的行为"""
         with self.get_session() as session:
+            # 首先验证内容是否适合记录行为
+            if not self._should_record_behavior_for_content(content_id):
+                logger.warning(f"内容 {content_id} 没有实际内容，不记录用户 {user_id} 的 {action} 行为")
+                # 返回一个虚拟的行为对象，但不保存到数据库
+                return UserBehavior(
+                    user_id=user_id,
+                    content_id=content_id,
+                    action=action,
+                    weight=0,  # 权重为0，表示无效行为
+                    source=source,
+                    session_id=session_id,
+                    extra_data=extra_data,
+                    timestamp=timestamp or datetime.utcnow()
+                )
+            
             # 设置默认权重
             if weight is None:
                 weight = CONFIG["behavior"]["weights"].get(action, 0.1)
@@ -156,7 +171,79 @@ class DatabaseService:
             session.refresh(behavior)
             
             logger.info(f"记录用户 {user_id} 对内容 {content_id} 的 {action} 行为")
+            
+            # 记录行为后，异步检查是否需要更新MBTI
+            self._async_check_mbti_updates(user_id, content_id)
+            
             return behavior
+    
+    def _should_record_behavior_for_content(self, content_id: int) -> bool:
+        """检查是否应该为内容记录行为（内容是否有实际价值）"""
+        # 这里可以扩展为检查数据库中的内容，或者调用搜狐接口验证
+        # 暂时返回True，实际使用时可以根据需要实现
+        return True
+    
+    def _async_check_mbti_updates(self, user_id: int, content_id: int):
+        """异步检查是否需要更新MBTI（在记录用户行为后调用）"""
+        try:
+            # 使用线程池异步执行，避免阻塞主流程
+            import threading
+            import asyncio
+            
+            def check_updates():
+                try:
+                    # 创建新的事件循环
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    # 检查帖子MBTI更新
+                    loop.run_until_complete(self._check_content_mbti_update(content_id))
+                    
+                    # 检查用户MBTI更新
+                    loop.run_until_complete(self._check_user_mbti_update(user_id))
+                    
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"异步检查MBTI更新失败: {e}")
+            
+            # 启动后台线程
+            thread = threading.Thread(target=check_updates, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            logger.error(f"启动异步MBTI检查失败: {e}")
+    
+    async def _check_content_mbti_update(self, content_id: int):
+        """检查内容是否需要更新MBTI"""
+        try:
+            from mbti_service import mbti_service
+            
+            # 调用MBTI服务检查内容更新
+            result = await mbti_service.update_content_mbti_when_users_reach_50(content_id)
+            
+            if result.get("updated"):
+                logger.info(f"内容 {content_id} MBTI自动更新成功")
+            else:
+                logger.debug(f"内容 {content_id} 无需更新MBTI: {result.get('reason', '未知原因')}")
+                
+        except Exception as e:
+            logger.error(f"检查内容 {content_id} MBTI更新失败: {e}")
+    
+    async def _check_user_mbti_update(self, user_id: int):
+        """检查用户是否需要更新MBTI"""
+        try:
+            from mbti_service import mbti_service
+            
+            # 调用MBTI服务检查用户更新
+            result = await mbti_service.update_user_mbti_when_posts_reach_50_multiple(user_id)
+            
+            if result.get("updated"):
+                logger.info(f"用户 {user_id} MBTI自动更新成功")
+            else:
+                logger.debug(f"用户 {user_id} 无需更新MBTI: {result.get('reason', '未知原因')}")
+                
+        except Exception as e:
+            logger.error(f"检查用户 {user_id} MBTI更新失败: {e}")
     
     def get_user_behaviors(self, user_id: int, action: str = None, 
                           start_date: datetime = None, end_date: datetime = None,
@@ -241,6 +328,11 @@ class DatabaseService:
                 "daily_average": round(daily_avg, 2)
             }
     
+    def get_user_behavior_count(self, user_id: int) -> int:
+        """获取用户总行为数"""
+        with self.get_session() as session:
+            return session.query(UserBehavior).filter(UserBehavior.user_id == user_id).count()
+    
     def get_recent_user_behaviors_for_analysis(self, user_id: int, 
                                               limit: int = 200) -> List[UserBehavior]:
         """获取用户最近的行为用于MBTI分析"""
@@ -281,6 +373,8 @@ class DatabaseService:
             # 创建新记录
             content_mbti = ContentMBTI(
                 content_id=content_id,
+                title=content_title,
+                content_type=content_type or "article",
                 E=normalized_probs.get("E", 0.5),
                 I=normalized_probs.get("I", 0.5),
                 S=normalized_probs.get("S", 0.5),
@@ -313,7 +407,116 @@ class DatabaseService:
             # 按创建时间排序（最新的在前）
             contents = query.order_by(desc(ContentMBTI.created_at)).limit(limit).all()
             
+            # 如果数据库中的内容不足，从搜狐接口获取更多内容
+            if len(contents) < limit:
+                logger.info(f"数据库内容不足{limit}条，从搜狐接口获取更多内容")
+                try:
+                    # 异步获取搜狐内容（这里需要调用者处理异步）
+                    # 暂时返回数据库中的内容，异步获取在外部处理
+                    pass
+                except Exception as e:
+                    logger.error(f"从搜狐接口获取内容失败: {e}")
+            
             return contents
+    
+    async def get_sohu_contents_for_recommendation(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """从搜狐接口获取内容用于推荐 - 只返回有实际内容的内容"""
+        try:
+            from sohu_client import sohu_client
+            
+            # 优化分页策略：增加每页数量，减少API调用次数
+            page_size = 50  # 增加到每页50条，减少API调用
+            target_limit = max(limit, 40)  # 确保至少获取40条
+            # 计算需要的页数，并增加一些缓冲页以确保能获取足够的内容
+            pages_needed = (target_limit + page_size - 1) // page_size
+            # 增加缓冲页，确保能获取足够的内容
+            buffer_pages = max(2, pages_needed // 2)  # 至少增加2页缓冲
+            total_pages = pages_needed + buffer_pages
+            
+            all_contents = []
+            valid_contents = []
+            
+            async with sohu_client as client:
+                for page in range(1, total_pages + 1):
+                    try:
+                        # 获取图文列表，aiRec=false确保每次结果不同
+                        result = await client.get_article_list(
+                            page_num=page,
+                            page_size=page_size,
+                            state="OnShelf",  # 只获取上架的内容
+                            site_id=11  # 默认站点ID
+                        )
+                        
+                        if result.get("code") == 200 and "data" in result:
+                            # 处理不同的数据结构
+                            data = result["data"]
+                            if isinstance(data, list):
+                                articles = data
+                            elif isinstance(data, dict):
+                                articles = data.get("data", [])
+                                if not articles and "list" in data:
+                                    articles = data.get("list", [])
+                            else:
+                                articles = []
+                            
+                            all_contents.extend(articles)
+                            
+                            # 筛选有实际内容的内容
+                            for article in articles:
+                                if self._is_valid_content_for_recommendation(article):
+                                    valid_contents.append(article)
+                                    # 如果已经获取足够的有内容的内容，停止
+                                    if len(valid_contents) >= target_limit:
+                                        break
+                            
+                            # 如果已经获取足够的有内容的内容，停止
+                            if len(valid_contents) >= target_limit:
+                                break
+                        else:
+                            logger.warning(f"获取第{page}页内容失败: {result.get('msg')}")
+                            
+                    except Exception as e:
+                        logger.error(f"获取第{page}页内容异常: {e}")
+                        continue
+            
+            logger.info(f"从搜狐接口获取了{len(all_contents)}条内容，其中{len(valid_contents)}条有实际内容，目标获取{target_limit}条，实际获取{len(valid_contents)}条")
+            
+            # 返回筛选后的有效内容，优先返回更多内容
+            return valid_contents[:target_limit]
+            
+        except Exception as e:
+            logger.error(f"从搜狐接口获取内容失败: {e}")
+            return []
+    
+    def _is_valid_content_for_recommendation(self, content: Dict[str, Any]) -> bool:
+        """检查内容是否适合推荐（有实际内容）"""
+        # 检查是否有标题
+        if not content.get('title'):
+            return False
+        
+        # 检查是否有封面图片
+        if not content.get('coverImage') and not content.get('coverUrl'):
+            return False
+        
+        # 检查内容状态
+        if content.get('state') != 'OnShelf':
+            return False
+        
+        if content.get('auditState') != 'Pass':
+            return False
+        
+        # 检查是否有实际内容（文字内容、图片、或标题+封面的组合）
+        has_content = (
+            content.get('content') or  # 有文字内容
+            content.get('images') or   # 有图片列表
+            (content.get('title') and (content.get('coverImage') or content.get('coverUrl')))  # 有标题+封面
+        )
+        
+        if not has_content:
+            logger.debug(f"内容 {content.get('id')} 没有实际内容，跳过推荐")
+            return False
+        
+        return True
     
     def get_viewed_content_ids(self, user_id: int, days: int = 30) -> List[int]:
         """获取用户已浏览的内容ID列表（只考虑like行为）"""
@@ -349,18 +552,234 @@ class DatabaseService:
         
         return similarities.tolist()
     
-    def get_recommendations_for_user(self, user_id: int, limit: int = 50,
-                                   content_type: str = None, 
-                                   similarity_threshold: float = 0.5,
-                                   exclude_viewed: bool = True,
-                                   fresh_days: int = 30) -> Dict[str, Any]:
-        """为用户生成推荐"""
-        # 获取用户MBTI档案
-        user_profile = self.get_user_profile(user_id)
-        if not user_profile:
-            # 创建默认档案
-            user_profile = self.create_user_profile(user_id)
+    def get_recommendations_for_user(self, user_id: int, limit: int = 10, offset: int = 0,
+                                   content_type: str = None, similarity_threshold: float = 0.5,
+                                   exclude_viewed: bool = True, fresh_days: int = 30) -> Dict[str, Any]:
+        """获取用户个性化推荐 - 直接取10条评分，评分后根据相似度排序
         
+        Args:
+            user_id: 用户ID
+            limit: 推荐数量（默认10条）
+            content_type: 内容类型
+            similarity_threshold: 相似度阈值
+            exclude_viewed: 是否排除已浏览内容
+            fresh_days: 内容新鲜度天数
+            
+        Returns:
+            推荐结果字典
+        """
+        try:
+            # 获取用户MBTI档案
+            user_profile = self.get_user_profile(user_id)
+            if not user_profile or not user_profile.mbti_type:
+                logger.info(f"用户 {user_id} 没有MBTI档案，使用随机推荐")
+                return self._get_random_recommendations(limit, content_type, fresh_days)
+            
+            # 获取用户MBTI向量
+            user_vector = [
+                user_profile.E, user_profile.S, user_profile.T, user_profile.J
+            ]
+            
+            logger.info(f"用户 {user_id} MBTI: {user_profile.mbti_type}, 向量: {user_vector}")
+            
+            # 从数据库获取已有MBTI评分的内容
+            candidate_contents = self.get_contents_for_recommendation(limit=limit)
+            
+            if not candidate_contents:
+                logger.warning("无法获取候选内容，使用随机推荐")
+                return self._get_random_recommendations(limit, content_type, fresh_days)
+            
+            # 过滤有效内容
+            valid_candidate_contents = []
+            for content in candidate_contents:
+                if hasattr(content, 'content_id') and content.content_id:
+                    valid_candidate_contents.append({
+                        'id': content.content_id,
+                        'title': getattr(content, 'title', ''),
+                        'content': getattr(content, 'content', '')
+                    })
+            
+            if not valid_candidate_contents:
+                logger.warning("没有有效内容，使用随机推荐")
+                return self._get_random_recommendations(limit, content_type, fresh_days)
+            
+            # 确保有足够的内容进行评分
+            target_contents = valid_candidate_contents[:max(limit, 10)]
+            
+            # 对内容进行MBTI评分（如果还没有评分）
+            contents_for_scoring = []
+            for content in target_contents:
+                content_id = content.get('id')
+                if not self.get_content_mbti(content_id):
+                    contents_for_scoring.append({
+                        'id': content_id,
+                        'title': content.get('title', ''),
+                        'content': content.get('content', '')
+                    })
+            
+            # 如果有内容需要评分，触发评分
+            if contents_for_scoring:
+                logger.info(f"需要评分 {len(contents_for_scoring)} 条内容")
+                # 这里会触发异步评分，但推荐接口立即返回
+                # 实际评分在后台进行
+            
+            # 获取所有内容的MBTI评分（包括已有的和新评分的）
+            scored_contents = []
+            for content in target_contents:
+                content_id = content.get('id')
+                content_mbti = self.get_content_mbti(content_id)
+                
+                if content_mbti:
+                    # 计算相似度
+                    content_vector = [
+                        content_mbti.E, content_mbti.S, content_mbti.T, content_mbti.J
+                    ]
+                    similarity = self.calculate_mbti_similarity([user_vector], [content_vector])[0]
+                    
+                    scored_contents.append({
+                        'content_id': content_id,
+                        'title': content.get('title', ''),
+                        'similarity_score': similarity,
+                        'mbti_vector': content_vector
+                    })
+                else:
+                    # 如果没有MBTI评分，使用默认相似度
+                    scored_contents.append({
+                        'content_id': content_id,
+                        'title': content.get('title', ''),
+                        'similarity_score': 0.5,
+                        'mbti_vector': [0.5, 0.5, 0.5, 0.5]
+                    })
+            
+            # 按相似度排序
+            scored_contents.sort(key=lambda x: x['similarity_score'], reverse=True)
+            
+            # 应用分页
+            start_index = offset
+            end_index = offset + limit
+            top_recommendations = scored_contents[start_index:end_index]
+            
+            # 构建推荐结果
+            recommendations = []
+            for item in top_recommendations:
+                recommendations.append({
+                    'content_id': item['content_id'],
+                    'title': item['title'],
+                    'similarity_score': round(item['similarity_score'], 4),
+                    'mbti_vector': item['mbti_vector']
+                })
+            
+            # 计算统计信息
+            if recommendations:
+                similarities = [r['similarity_score'] for r in recommendations]
+                avg_similarity = sum(similarities) / len(similarities)
+                max_similarity = max(similarities)
+                min_similarity = min(similarities)
+            else:
+                avg_similarity = max_similarity = min_similarity = 0.0
+            
+            return {
+                'recommendations': recommendations,
+                'user_mbti': {
+                    'type': user_profile.mbti_type,
+                    'vector': user_vector
+                },
+                'similarity_stats': {
+                    'average': round(avg_similarity, 4),
+                    'maximum': round(max_similarity, 4),
+                    'minimum': round(min_similarity, 4)
+                },
+                'metadata': {
+                    'total_candidates': len(candidate_contents),
+                    'valid_candidates': len(valid_candidate_contents),
+                    'scored_contents': len(scored_contents),
+                    'recommendation_count': len(recommendations),
+                    'scoring_pending': len(contents_for_scoring)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"获取用户 {user_id} 推荐失败: {e}")
+            # 降级到随机推荐
+            return self._get_random_recommendations(limit, content_type, fresh_days)
+    
+    def _get_random_recommendations(self, limit: int, content_type: str = None, 
+                                   fresh_days: int = 30) -> Dict[str, Any]:
+        """获取随机推荐（用于行为数不足或MBTI未建立时）"""
+        try:
+            # 获取候选内容
+            candidate_contents = self.get_contents_for_recommendation(
+                content_type=content_type,
+                fresh_days=fresh_days,
+                limit=1000
+            )
+            
+            if not candidate_contents:
+                logger.warning("数据库中没有候选内容")
+                return {
+                    'recommendations': [],
+                    'user_mbti': None,
+                    'similarity_stats': {'average': 0.0, 'maximum': 0.0, 'minimum': 0.0},
+                    'metadata': {
+                        'total_candidates': 0,
+                        'valid_candidates': 0,
+                        'scored_contents': 0,
+                        'recommendation_count': 0,
+                        'scoring_pending': 0
+                    }
+                }
+            
+            # 随机选择内容
+            import random
+            if len(candidate_contents) < limit:
+                selected_contents = candidate_contents
+            else:
+                selected_contents = random.sample(candidate_contents, limit)
+            
+            # 构建推荐结果
+            recommendations = []
+            for content in selected_contents:
+                recommendations.append({
+                    'content_id': content.content_id,
+                    'title': getattr(content, 'title', ''),
+                    'similarity_score': 0.5,  # 随机推荐使用默认相似度
+                    'mbti_vector': [0.5, 0.5, 0.5, 0.5]
+                })
+            
+            return {
+                'recommendations': recommendations,
+                'user_mbti': None,
+                'similarity_stats': {'average': 0.5, 'maximum': 0.5, 'minimum': 0.5},
+                'metadata': {
+                    'total_candidates': len(candidate_contents),
+                    'valid_candidates': len(selected_contents),
+                    'scored_contents': len(selected_contents),
+                    'recommendation_count': len(recommendations),
+                    'scoring_pending': 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"获取随机推荐失败: {e}")
+            return {
+                'recommendations': [],
+                'user_mbti': None,
+                'similarity_stats': {'average': 0.0, 'maximum': 0.0, 'minimum': 0.0},
+                'metadata': {
+                    'total_candidates': 0,
+                    'valid_candidates': 0,
+                    'scored_contents': 0,
+                    'recommendation_count': 0,
+                    'scoring_pending': 0
+                }
+            }
+    
+    def _get_similarity_based_recommendations(self, user_id: int, user_profile, 
+                                            limit: int, content_type: str = None,
+                                            similarity_threshold: float = 0.5,
+                                            exclude_viewed: bool = True,
+                                            fresh_days: int = 30) -> Dict[str, Any]:
+        """基于MBTI相似度的推荐"""
         # 获取用户MBTI向量
         user_vector = [
             user_profile.E, user_profile.I, user_profile.S, user_profile.N,
@@ -372,60 +791,65 @@ class DatabaseService:
         if exclude_viewed:
             exclude_content_ids = self.get_viewed_content_ids(user_id, fresh_days)
         
-        # 获取候选内容
+        # 获取候选内容 - 增加候选数量以确保有足够的内容筛选
         candidate_contents = self.get_contents_for_recommendation(
             content_type=content_type,
             fresh_days=fresh_days,
             exclude_content_ids=exclude_content_ids,
-            limit=1000  # 获取更多候选内容用于计算
+            limit=2000  # 增加到2000条，确保有足够的内容进行筛选
         )
         
-        if not candidate_contents:
+        # 筛选有实际内容的内容
+        valid_candidate_contents = [
+            content for content in candidate_contents 
+            if self._is_valid_content_for_recommendation(content.to_dict() if hasattr(content, 'to_dict') else content)
+        ]
+        
+        if not valid_candidate_contents:
             return {
                 "user_id": user_id,
                 "user_mbti_type": user_profile.mbti_type,
                 "user_mbti_probabilities": user_profile.to_dict()["probabilities"],
                 "recommendations": [],
                 "metadata": {
-                    "total_candidates": 0,
+                    "total_candidates": len(candidate_contents),
                     "filtered_count": 0,
+                    "valid_content_count": 0,
                     "avg_similarity": 0.0,
                     "generation_time": datetime.utcnow().isoformat(),
-                    "algorithm_version": "v1.0"
+                    "algorithm_version": "v1.0",
+                    "recommendation_type": "similarity",
+                    "reason": "没有有效内容可推荐"
                 }
             }
         
         # 计算相似度
-        content_vectors = [content.get_vector() for content in candidate_contents]
+        content_vectors = [content.get_vector() for content in valid_candidate_contents]
         similarities = self.calculate_mbti_similarity(user_vector, content_vectors)
         
-        # 生成所有推荐（不使用阈值过滤）
+        # 生成所有推荐
         all_recommendations = []
-        for i, (content, similarity) in enumerate(zip(candidate_contents, similarities)):
+        for i, (content, similarity) in enumerate(zip(valid_candidate_contents, similarities)):
             all_recommendations.append({
-                "content_id": content.content_id,
+                "content_id": content.content_id if hasattr(content, 'content_id') else content.get('id'),
                 "similarity_score": round(similarity, 4),
-                "mbti_match_traits": self._get_matching_traits(user_profile, content),
-                "rank": 0,  # 稍后设置
-                "estimated_engagement": min(similarity * 0.8, 1.0)  # 使用默认质量分数
+                "rank": 0,
+                "estimated_engagement": min(similarity * 0.8, 1.0),
+                "recommendation_type": "similarity"
             })
         
         # 按相似度排序
         all_recommendations.sort(key=lambda x: x["similarity_score"], reverse=True)
         
-        # 确保至少返回50条推荐（如果有足够的候选内容）
-        min_recommendations = 50
-        target_limit = max(limit, min_recommendations)
-        
-        # 先尝试用阈值过滤
+        # 应用阈值过滤
         filtered_recommendations = [rec for rec in all_recommendations if rec["similarity_score"] >= similarity_threshold]
         
-        # 如果过滤后不足50条，直接取前N条最相似的
-        if len(filtered_recommendations) < min_recommendations:
-            recommendations = all_recommendations[:target_limit]
-            logger.info(f"阈值过滤后推荐不足{min_recommendations}条，直接返回前{len(recommendations)}条最相似的")
+        # 如果过滤后不足limit条，返回前limit条最相似的
+        if len(filtered_recommendations) < limit:
+            recommendations = filtered_recommendations[:limit]
+            logger.info(f"阈值过滤后推荐不足{limit}条，返回前{len(recommendations)}条最相似的")
         else:
-            recommendations = filtered_recommendations[:target_limit]
+            recommendations = filtered_recommendations[:limit]
         
         # 设置排名
         for i, rec in enumerate(recommendations):
@@ -441,10 +865,12 @@ class DatabaseService:
             "recommendations": recommendations,
             "metadata": {
                 "total_candidates": len(candidate_contents),
+                "valid_content_count": len(valid_candidate_contents),
                 "filtered_count": len(recommendations),
                 "avg_similarity": round(avg_similarity, 4),
                 "generation_time": datetime.utcnow().isoformat(),
                 "algorithm_version": "v1.0",
+                "recommendation_type": "similarity",
                 "cache_hit": False
             }
         }
@@ -454,31 +880,7 @@ class DatabaseService:
         
         return result
     
-    def _get_matching_traits(self, user_profile: UserProfile, content: ContentMBTI) -> List[str]:
-        """获取匹配的MBTI特征"""
-        matching_traits = []
-        
-        if user_profile.E > user_profile.I and content.E > content.I:
-            matching_traits.append("E")
-        elif user_profile.I > user_profile.E and content.I > content.E:
-            matching_traits.append("I")
-            
-        if user_profile.S > user_profile.N and content.S > content.N:
-            matching_traits.append("S")
-        elif user_profile.N > user_profile.S and content.N > content.S:
-            matching_traits.append("N")
-            
-        if user_profile.T > user_profile.F and content.T > content.F:
-            matching_traits.append("T")
-        elif user_profile.F > user_profile.T and content.F > content.T:
-            matching_traits.append("F")
-            
-        if user_profile.J > user_profile.P and content.J > content.P:
-            matching_traits.append("J")
-        elif user_profile.P > user_profile.J and content.P > content.J:
-            matching_traits.append("P")
-        
-        return matching_traits
+
     
 
     
@@ -519,6 +921,200 @@ class DatabaseService:
                 "total_contents": content_count,
                 "total_recommendations": recommendation_count
             }
+    
+    def get_content_operation_users(self, content_id: int) -> List[int]:
+        """获取对指定内容进行过操作的用户ID列表"""
+        with self.get_session() as session:
+            # 查询所有对该内容进行过操作的用户
+            behaviors = session.query(UserBehavior).filter(
+                UserBehavior.content_id == content_id
+            ).all()
+            
+            # 提取唯一的用户ID
+            user_ids = list(set([behavior.user_id for behavior in behaviors]))
+            logger.info(f"内容 {content_id} 有 {len(user_ids)} 个操作用户")
+            
+            return user_ids
+    
+    def get_user_operation_posts(self, user_id: int) -> List[int]:
+        """获取用户操作过的帖子ID列表"""
+        with self.get_session() as session:
+            # 查询用户的所有行为记录
+            behaviors = session.query(UserBehavior).filter(
+                UserBehavior.user_id == user_id
+            ).all()
+            
+            # 提取唯一的帖子ID
+            post_ids = list(set([behavior.content_id for behavior in behaviors]))
+            logger.info(f"用户 {user_id} 操作过 {len(post_ids)} 个帖子")
+            
+            return post_ids
+    
+    def update_content_mbti(self, content_id: int, probabilities: Dict[str, float]) -> ContentMBTI:
+        """更新内容的MBTI评分"""
+        with self.get_session() as session:
+            # 查找现有记录
+            content_mbti = session.query(ContentMBTI).filter(
+                ContentMBTI.content_id == content_id
+            ).first()
+            
+            if not content_mbti:
+                logger.warning(f"内容 {content_id} 没有MBTI记录，无法更新")
+                return None
+            
+            # 标准化概率
+            normalized_probs = normalize_mbti_probabilities(probabilities)
+            
+            # 更新MBTI概率
+            content_mbti.E = normalized_probs.get("E", 0.5)
+            content_mbti.I = normalized_probs.get("I", 0.5)
+            content_mbti.S = normalized_probs.get("S", 0.5)
+            content_mbti.N = normalized_probs.get("N", 0.5)
+            content_mbti.T = normalized_probs.get("T", 0.5)
+            content_mbti.F = normalized_probs.get("F", 0.5)
+            content_mbti.J = normalized_probs.get("J", 0.5)
+            content_mbti.P = normalized_probs.get("P", 0.5)
+            
+            # 更新修改时间
+            content_mbti.updated_at = datetime.utcnow()
+            
+            session.commit()
+            session.refresh(content_mbti)
+            
+            logger.info(f"内容 {content_id} MBTI评分更新完成")
+            return content_mbti
+    
+    def get_total_recommendations_count(self, user_id: int, content_type: str = None,
+                                      similarity_threshold: float = 0.5,
+                                      exclude_viewed: bool = True,
+                                      fresh_days: int = 30) -> int:
+        """获取用户推荐的总数量（用于分页）"""
+        try:
+            # 获取用户MBTI特征
+            user_profile = self.get_user_profile(user_id)
+            if not user_profile:
+                return 0
+            
+            # 获取候选内容
+            candidate_contents = self.get_contents_for_recommendation(
+                content_type=content_type,
+                fresh_days=fresh_days,
+                limit=1000  # 获取足够多的候选内容
+            )
+            
+            if not candidate_contents:
+                return 0
+            
+            # 计算相似度
+            user_vector = user_profile.get_vector()
+            content_vectors = [content.get_vector() for content in candidate_contents]
+            similarities = self.calculate_mbti_similarity([user_vector], content_vectors)
+            
+            # 过滤相似度达标的内容
+            valid_contents = []
+            for i, similarity in enumerate(similarities):
+                if similarity >= similarity_threshold:
+                    valid_contents.append(candidate_contents[i])
+            
+            # 如果排除已浏览内容
+            if exclude_viewed:
+                viewed_content_ids = self.get_user_viewed_content_ids(user_id)
+                valid_contents = [content for content in valid_contents 
+                               if content.content_id not in viewed_content_ids]
+            
+            return len(valid_contents)
+            
+        except Exception as e:
+            logger.error(f"获取用户 {user_id} 推荐总数失败: {e}")
+            return 0
+    
+    def get_user_viewed_content_ids(self, user_id: int) -> List[int]:
+        """获取用户已浏览的内容ID列表"""
+        with self.get_session() as session:
+            behaviors = session.query(UserBehavior).filter(
+                UserBehavior.user_id == user_id,
+                UserBehavior.action == "view"
+            ).all()
+            
+            return [behavior.content_id for behavior in behaviors]
+    
+    def update_content_info(self, content_id: int, sohu_content: Dict[str, Any]) -> bool:
+        """更新帖子内容信息（从搜狐API获取的数据）"""
+        try:
+            with self.get_session() as session:
+                content_mbti = session.query(ContentMBTI).filter(ContentMBTI.content_id == content_id).first()
+                
+                if not content_mbti:
+                    logger.warning(f"内容 {content_id} 没有MBTI记录，无法更新内容信息")
+                    return False
+                
+                # 更新帖子内容字段
+                content_mbti.title = sohu_content.get("title")
+                content_mbti.cover_image = sohu_content.get("coverImage") or sohu_content.get("coverUrl")
+                content_mbti.content = sohu_content.get("content")
+                content_mbti.author = sohu_content.get("userName") or sohu_content.get("nickName")
+                
+                # 处理发布时间
+                publish_time_str = sohu_content.get("createTime") or sohu_content.get("publishTime")
+                if publish_time_str:
+                    try:
+                        content_mbti.publish_time = datetime.fromisoformat(publish_time_str.replace('Z', '+00:00'))
+                    except:
+                        content_mbti.publish_time = None
+                
+                content_mbti.content_type = sohu_content.get("mediaContentType", "article").lower()
+                
+                session.commit()
+                logger.info(f"内容 {content_id} 的帖子信息已更新")
+                return True
+                
+        except Exception as e:
+            logger.error(f"更新内容 {content_id} 的帖子信息失败: {e}")
+            return False
+    
+    def get_user_recommendation_progress(self, user_id: int) -> Dict[str, Any]:
+        """获取用户推荐进度"""
+        with self.get_session() as session:
+            profile = session.query(UserProfile).filter(UserProfile.user_id == user_id).first()
+            
+            if not profile:
+                return {
+                    "current_page": 0,
+                    "last_recommendation_time": None,
+                    "total_recommendations": 0
+                }
+            
+            return {
+                "current_page": profile.current_recommendation_page or 0,
+                "last_recommendation_time": profile.last_recommendation_time.isoformat() if profile.last_recommendation_time else None,
+                "total_recommendations": profile.total_behaviors_analyzed or 0
+            }
+    
+    def update_user_recommendation_progress(self, user_id: int, current_page: int) -> bool:
+        """更新用户推荐进度"""
+        try:
+            with self.get_session() as session:
+                profile = session.query(UserProfile).filter(UserProfile.user_id == user_id).first()
+                
+                if not profile:
+                    logger.warning(f"用户 {user_id} 没有档案，无法更新推荐进度")
+                    return False
+                
+                profile.current_recommendation_page = current_page
+                profile.last_recommendation_time = datetime.utcnow()
+                
+                session.commit()
+                logger.info(f"用户 {user_id} 推荐进度已更新到第 {current_page} 页")
+                return True
+                
+        except Exception as e:
+            logger.error(f"更新用户 {user_id} 推荐进度失败: {e}")
+            return False
+    
+    def get_next_recommendation_page(self, user_id: int) -> int:
+        """获取用户下一推荐页数"""
+        progress = self.get_user_recommendation_progress(user_id)
+        return progress["current_page"] + 1
 
 # 全局数据库服务实例
 db_service = DatabaseService()

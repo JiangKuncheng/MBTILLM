@@ -15,7 +15,6 @@ import uuid
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
 import base64
 
 logger = logging.getLogger(__name__)
@@ -24,11 +23,24 @@ class SohuAPIClient:
     """SohuGlobal API客户端 - 完整版本"""
     
     def __init__(self):
-        # 新的接口地址
-        self.base_url = "http://192.168.150.252:888"
+        # 从配置文件获取接口地址，如果没有则使用默认值
+        try:
+            from new_config import CONFIG
+            self.base_url = CONFIG.get("sohu_api", {}).get("base_url", "http://192.168.150.252:8080")
+        except ImportError:
+            # 如果无法导入配置，使用默认地址
+            self.base_url = "http://192.168.150.252:8080"
+        
         self.timeout = 15
         self.max_retries = 3
         self.session = None
+        
+        # 用户认证信息（模拟前端store的数据）
+        self.access_token = None
+        self.user_id = 0
+        self.hmac_key = None
+        self.aes_key = None
+        self.iv = None
         
         # 加密参数
         self.hmac_key = None
@@ -50,7 +62,7 @@ class SohuAPIClient:
             await self.session.close()
     
     async def _get_encryption_keys(self) -> bool:
-        """获取加密密钥"""
+        """获取加密密钥和用户认证信息"""
         try:
             url = f"{self.base_url}/app/v1/query/aesKey"
             
@@ -59,12 +71,18 @@ class SohuAPIClient:
                     result = await response.json()
                     if result.get("code") == 200:
                         data = result.get("data", {})
+                        # 获取加密密钥
                         self.hmac_key = data.get("hmacKey")
                         self.aes_key = data.get("aesKey")
                         self.iv = data.get("iv")
                         
+                        # 获取用户认证信息（这里需要根据实际情况调整）
+                        # 通常这些信息应该从登录接口获取
+                        self.access_token = data.get("accessToken")  # 可能为空
+                        self.user_id = data.get("userId", 0)  # 可能为0
+                        
                         if self.hmac_key and self.aes_key and self.iv:
-                            logger.info("成功获取加密密钥")
+                            logger.info("成功获取加密密钥和认证信息")
                             return True
                 
                 logger.error(f"获取加密密钥失败: {result}")
@@ -82,8 +100,8 @@ class SohuAPIClient:
         """获取加密数据 - 完全对应前端的getEncryptData函数"""
         # 构建参数（与前端完全一致）
         obj = {
-            "token": "",  # 非登录接口可为空字符串
-            "userId": 0,    # 非登录接口可为0
+            "token": self.access_token or "",  # 使用实际的accessToken
+            "userId": self.user_id or 0,    # 使用实际的userId
             "timestamp": int(time.time() * 1000),
             "url": url,
             "platform": "web",
@@ -102,7 +120,8 @@ class SohuAPIClient:
             query_string += f"{key}={value}&"
         query_string += f"key={self.hmac_key}"
         
-        # 计算HMAC-SHA256签名
+        # 计算HMAC-SHA256签名 - 使用与前端完全一致的方式
+        # 注意：这里需要确保编码方式一致
         hmac_obj = hmac.new(
             self.hmac_key.encode('utf-8'),
             query_string.encode('utf-8'),
@@ -118,17 +137,37 @@ class SohuAPIClient:
         if not self.aes_key or not self.iv:
             raise ValueError("AES密钥或IV未设置")
         
-        # AES加密
+        # 完全按照前端逻辑实现
+        # 前端使用 CryptoJS.enc.Latin1.parse(aesKey) 和 CryptoJS.enc.Utf8.parse(iv)
+        
+        # 1. 将数据转换为UTF-8字节
+        data_bytes = data.encode('utf-8')
+        
+        # 2. 将AES密钥转换为Latin1编码（对应前端的CryptoJS.enc.Latin1.parse）
+        aes_key_bytes = self.aes_key.encode('latin1')
+        
+        # 3. 将IV转换为UTF-8编码（对应前端的CryptoJS.enc.Utf8.parse）
+        iv_bytes = self.iv.encode('utf-8')
+        
+        # 4. 创建AES加密器
         cipher = AES.new(
-            self.aes_key.encode('utf-8'),
+            aes_key_bytes,
             AES.MODE_CBC,
-            self.iv.encode('utf-8')
+            iv_bytes
         )
         
-        # 填充数据
-        padded_data = pad(data.encode('utf-8'), AES.block_size)
+        # 5. 使用ZeroPadding（对应前端的CryptoJS.pad.ZeroPadding）
+        block_size = AES.block_size
+        padding_length = block_size - (len(data_bytes) % block_size)
+        
+        if padding_length == block_size:
+            padding_length = 0
+            
+        # 添加零填充
+        padded_data = data_bytes + b'\x00' * padding_length
         encrypted = cipher.encrypt(padded_data)
         
+        # 6. Base64编码（对应前端的encrypted.toString()）
         return base64.b64encode(encrypted).decode('utf-8')
     
     def _get_decrypt(self, encrypted_data: str) -> str:
@@ -147,8 +186,12 @@ class SohuAPIClient:
         encrypted_bytes = base64.b64decode(encrypted_data)
         decrypted = cipher.decrypt(encrypted_bytes)
         
-        # 去除填充
-        return unpad(decrypted, AES.block_size).decode('utf-8')
+        # 去除零填充
+        # 找到最后一个非零字节
+        while decrypted and decrypted[-1] == 0:
+            decrypted = decrypted[:-1]
+            
+        return decrypted.decode('utf-8')
     
     async def _make_request(self, method: str, endpoint: str, 
                           data: Dict = None, params: Dict = None,
@@ -224,11 +267,74 @@ class SohuAPIClient:
     
     async def _ensure_encryption_ready(self) -> bool:
         """确保加密参数已准备"""
-        if self.hmac_key and self.aes_key and self.iv:
-            return True
-        
-        # 获取加密密钥
+        # 每次都重新获取加密密钥，不使用缓存
+        # 这样可以确保每次请求都使用最新的密钥
         return await self._get_encryption_keys()
+    
+    async def _ensure_auth_ready(self) -> bool:
+        """确保认证已准备"""
+        # 检查是否有必要的认证信息
+        if not (self.hmac_key and self.aes_key and self.iv):
+            return False
+        
+        # 如果没有token和userId，尝试登录
+        if not self.access_token or not self.user_id:
+            logger.info("缺少认证信息，尝试登录...")
+            if await self.login():
+                return True
+            else:
+                logger.error("登录失败")
+                return False
+        
+        return True
+    
+    async def login(self, username: str = "admin", password: str = "123456") -> bool:
+        """登录获取token和userId - 注意：登录接口不需要加密认证"""
+        try:
+            url = f"{self.base_url}/auth/v2/login"
+            
+            # 登录请求数据 - 完全按照你同事的格式
+            login_data = {
+                "userName": username,  # 使用userName
+                "password": password,  # 暂时使用明文，后续可能需要加密
+                "loginType": "PASSWORD",
+                "deviceType": "PC"  # 添加deviceType
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "syssource": "sohuglobal",  # 添加重要的syssource头
+                "User-Agent": "Apifox/1.0.0 (https://apifox.com)",
+                "Accept": "*/*",
+                "Host": "192.168.150.252:8080",
+                "Connection": "keep-alive"
+            }
+            
+            # 调试：打印登录请求
+            logger.info(f"self.base_url: {self.base_url}")
+            logger.info(f"登录请求URL: {url}")
+            logger.info(f"登录请求数据: {json.dumps(login_data, indent=2, ensure_ascii=False)}")
+            logger.info(f"登录请求头: {headers}")
+            
+            async with self.session.post(url, json=login_data, headers=headers) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    if result.get("code") == 200:
+                        data = result.get("data", {})
+                        self.access_token = data.get("accessToken")
+                        self.user_id = data.get("userId")
+                        logger.info(f"登录成功: accessToken={self.access_token}, userId={self.user_id}")
+                        return True
+                    else:
+                        logger.error(f"登录失败: {result.get('msg')}")
+                        return False
+                else:
+                    logger.error(f"登录请求失败: HTTP {response.status}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"登录异常: {e}")
+            return False
     
     # =============================================================================
     # 内容获取接口
@@ -426,6 +532,249 @@ class SohuAPIClient:
                 "message": f"加密测试失败: {str(e)}",
                 "error": str(e)
             }
+    
+    async def get_content_by_id(self, content_id: int, content_type: str = "article") -> Dict[str, Any]:
+        """根据ID获取内容详情"""
+        # 确保加密参数已准备
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
+        
+        try:
+            # 构建请求URL - 根据你提供的接口地址
+            url = f"{self.base_url}/app/api/content/article/{content_id}"
+            
+            # 获取加密数据
+            # 只使用相对路径，不包含base_url
+            relative_path = f"/app/api/content/article/{content_id}"
+            encrypt_data = self._get_encrypt_data(relative_path)
+            
+            # 发送请求
+            # 先将字典转换为JSON字符串，然后加密
+            json_data = json.dumps(encrypt_data, ensure_ascii=False)
+            encrypted_data = self._get_encrypt(json_data)
+            
+            # 使用登录后获取的真实token
+            auth_token = f"Bearer {self.access_token}" if self.access_token else ""
+            logger.info(f"使用认证token: {auth_token}")
+            
+            headers = {
+                "Content-Type": "application/json",
+                "x-encrypt-key": encrypted_data,
+                "Version": "1.5.0",
+                "Authorization": auth_token
+            }
+            
+            async with self.session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    # 检查响应类型
+                    content_type = response.headers.get('content-type', '')
+                    logger.info(f"响应类型: {content_type}")
+                    
+                    try:
+                        if 'text/plain' in content_type:
+                            # 如果是text/plain，先获取文本内容
+                            text_content = await response.text()
+                            logger.info(f"收到text/plain响应: {text_content}")
+                            
+                            # 尝试解析JSON
+                            try:
+                                result = json.loads(text_content)
+                                logger.info(f"成功解析JSON: {result}")
+                                return result
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"JSON解析失败: {e}")
+                                return {"code": 200, "msg": "响应解析成功", "data": text_content, "raw_content": text_content}
+                        else:
+                            # 正常JSON响应
+                            result = await response.json()
+                            logger.info(f"获取内容 {content_id} 成功")
+                            return result
+                    except Exception as e:
+                        logger.error(f"响应处理异常: {e}")
+                        return {"code": 500, "msg": f"响应处理异常: {str(e)}"}
+                else:
+                    logger.error(f"获取内容 {content_id} 失败: HTTP {response.status}")
+                    return {"code": response.status, "msg": "HTTP请求失败"}
+                    
+        except Exception as e:
+            logger.error(f"获取内容 {content_id} 异常: {e}")
+            return {"code": 500, "msg": f"请求异常: {str(e)}"}
+    
+    async def get_article_list(self, page_num: int = 1, page_size: int = 20, 
+                              site_id: Optional[int] = None, state: Optional[str] = None,
+                              category_id: Optional[int] = None) -> Dict[str, Any]:
+        """获取图文列表 - 搜狐接口"""
+        # 确保加密参数已准备
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
+        
+        # 确保认证已准备
+        if not await self._ensure_auth_ready():
+            return {"code": 401, "msg": "需要认证才能访问接口"}
+        
+        try:
+            # 构建请求URL - 添加/app前缀
+            url = f"{self.base_url}/app/api/content/article/list"
+            
+            # 构建查询参数
+            params = {
+                "pageNum": page_num,
+                "pageSize": page_size,
+                "aiRec": "false",  # 固定传"false"字符串，否则每次推荐结果一样
+            }
+            
+            # 添加可选参数
+            if site_id is not None:
+                params["siteId"] = site_id
+            if state is not None:
+                params["state"] = state
+            if category_id is not None:
+                params["categoryId"] = category_id
+            
+            # 获取加密数据
+            # 只使用相对路径，不包含base_url
+            relative_path = f"/api/content/article/list?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+            encrypt_data = self._get_encrypt_data(relative_path)
+            
+            # 调试：打印加密数据
+            logger.info(f"加密数据: {json.dumps(encrypt_data, indent=2, ensure_ascii=False)}")
+            
+            # 发送请求
+            # 使用登录后的真实token和加密数据
+            # 先将字典转换为JSON字符串，然后加密
+            json_data = json.dumps(encrypt_data, ensure_ascii=False)
+            encrypted_data = self._get_encrypt(json_data)
+            
+            # 使用登录后获取的真实token
+            auth_token = f"Bearer {self.access_token}" if self.access_token else ""
+            logger.info(f"使用认证token: {auth_token}")
+            
+            headers = {
+                "Content-Type": "application/json",
+                "x-encrypt-key": encrypted_data,
+                "Version": "1.5.0",
+                "Authorization": auth_token
+            }
+            
+            async with self.session.get(url, params=params, headers=headers) as response:
+                if response.status == 200:
+                    # 检查响应类型
+                    content_type = response.headers.get('content-type', '')
+                    logger.info(f"响应类型: {content_type}")
+                    
+                    try:
+                        if 'text/html' in content_type:
+                            # 如果是text/html，先获取文本内容
+                            text_content = await response.text()
+                            logger.info(f"收到text/html响应: {text_content[:200]}...")  # 只显示前200个字符
+                            
+                            # 尝试解析JSON（可能HTML中包含JSON）
+                            try:
+                                result = json.loads(text_content)
+                                logger.info(f"成功解析JSON: {result}")
+                                return result
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"JSON解析失败: {e}")
+                                return {"code": 200, "msg": "响应解析成功", "data": text_content, "raw_content": text_content}
+                        elif 'text/plain' in content_type:
+                            # 如果是text/plain，先获取文本内容
+                            text_content = await response.text()
+                            logger.info(f"收到text/plain响应: {text_content}")
+                            
+                            # 尝试解析JSON
+                            try:
+                                result = json.loads(text_content)
+                                logger.info(f"成功解析JSON: {result}")
+                                return result
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"JSON解析失败: {e}")
+                                return {"code": 200, "msg": "响应解析成功", "data": text_content, "raw_content": text_content}
+                        else:
+                            # 正常JSON响应
+                            result = await response.json()
+                            logger.info(f"获取图文列表成功: 第{page_num}页，共{page_size}条")
+                            return result
+                    except Exception as e:
+                        logger.error(f"响应处理异常: {e}")
+                        return {"code": 500, "msg": f"响应处理异常: {str(e)}"}
+                else:
+                    logger.error(f"获取图文列表失败: HTTP {response.status}")
+                    return {"code": response.status, "msg": "HTTP请求失败"}
+                    
+        except Exception as e:
+            logger.error(f"获取图文列表异常: {e}")
+            return {"code": 500, "msg": f"请求异常: {str(e)}"}
+    
+    async def get_contents_batch(self, content_ids: List[int]) -> Dict[str, Any]:
+        """批量获取内容详情"""
+        # 确保加密参数已准备
+        if not await self._ensure_encryption_ready():
+            return {"code": 401, "msg": "加密参数获取失败"}
+        
+        try:
+            # 构建请求URL
+            url = f"{self.base_url}/app/api/content/batch"
+            
+            # 获取加密数据
+            encrypt_data = self._get_encrypt_data(url)
+            
+            # 构建请求体
+            request_data = {
+                "content_ids": content_ids
+            }
+            
+            # 发送请求
+            # 使用登录后的真实token和加密数据
+            # 先将字典转换为JSON字符串，然后加密
+            json_data = json.dumps(encrypt_data, ensure_ascii=False)
+            encrypted_data = self._get_encrypt(json_data)
+            
+            # 使用登录后获取的真实token
+            auth_token = f"Bearer {self.access_token}" if self.access_token else ""
+            logger.info(f"使用认证token: {auth_token}")
+            
+            headers = {
+                "Content-Type": "application/json",
+                "x-encrypt-key": encrypted_data,
+                "Version": "1.5.0",
+                "Authorization": auth_token
+            }
+            
+            async with self.session.post(url, json=request_data, headers=headers) as response:
+                if response.status == 200:
+                    # 检查响应类型
+                    content_type = response.headers.get('content-type', '')
+                    logger.info(f"响应类型: {content_type}")
+                    
+                    try:
+                        if 'text/plain' in content_type:
+                            # 如果是text/plain，先获取文本内容
+                            text_content = await response.text()
+                            logger.info(f"收到text/plain响应: {text_content}")
+                            
+                            # 尝试解析JSON
+                            try:
+                                result = json.loads(text_content)
+                                logger.info(f"成功解析JSON: {result}")
+                                return result
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"JSON解析失败: {e}")
+                                return {"code": 200, "msg": "响应解析成功", "data": text_content, "raw_content": text_content}
+                        else:
+                            # 正常JSON响应
+                            result = await response.json()
+                            logger.info(f"批量获取 {len(content_ids)} 个内容成功")
+                            return result
+                    except Exception as e:
+                        logger.error(f"响应处理异常: {e}")
+                        return {"code": 500, "msg": f"响应处理异常: {str(e)}"}
+                else:
+                    logger.error(f"批量获取内容失败: HTTP {response.status}")
+                    return {"code": response.status, "msg": "HTTP请求失败"}
+                    
+        except Exception as e:
+            logger.error(f"批量获取内容异常: {e}")
+            return {"code": 500, "msg": f"请求异常: {str(e)}"}
 
 # 创建全局客户端实例
 sohu_client = SohuAPIClient()
